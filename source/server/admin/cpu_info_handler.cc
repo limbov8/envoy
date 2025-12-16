@@ -6,7 +6,9 @@
 #if defined(__linux__)
 #include <dirent.h>
 #include <unistd.h>
+#include <cstring>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
 #endif
@@ -17,63 +19,196 @@ namespace Envoy {
 namespace Server {
 
 #if defined(__linux__)
-// Read the system uptime in seconds from /proc/uptime.
-static bool readSystemUptime(double& uptime_seconds) {
-  std::ifstream uptime_file("/proc/uptime");
-  if (!uptime_file.is_open()) {
+
+// Sampling delay in microseconds, matching top.c's LIB_USLEEP
+constexpr int LIB_USLEEP = 200000; // 200ms
+
+// Process information structure matching procps implementation.
+// Keeps all fields even if not currently used for future extensibility.
+struct proc_t {
+  int pid;                    // process id
+  char state;                 // state (R, S, D, Z, T, etc.)
+  int ppid;                   // parent process id
+  int pgrp;                   // process group id
+  int session;                // session id
+  int tty;                    // controlling tty (tty_nr)
+  int tpgid;                  // tty process group id
+  unsigned long flags;        // kernel flags
+  unsigned long min_flt;      // minor page faults
+  unsigned long cmin_flt;     // minor page faults of children
+  unsigned long maj_flt;      // major page faults
+  unsigned long cmaj_flt;     // major page faults of children
+  unsigned long long utime;   // user mode jiffies
+  unsigned long long stime;   // kernel mode jiffies
+  unsigned long long cutime;  // user mode jiffies with children
+  unsigned long long cstime;  // kernel mode jiffies with children
+  int priority;               // kernel scheduling priority
+  int nice;                   // nice value
+  int nlwp;                   // number of threads
+  unsigned long alarm;        // 'alarm' == it_real_value (obsolete, always 0)
+  unsigned long long start_time; // start time in jiffies since boot
+  unsigned long vsize;        // virtual memory size in bytes
+  unsigned long rss;          // resident set size
+  unsigned long rss_rlim;     // rss limit
+  unsigned long start_code;   // address of start of code segment
+  unsigned long end_code;     // address of end of code segment
+  unsigned long start_stack;  // address of start of stack
+  unsigned long kstk_esp;     // kernel stack pointer
+  unsigned long kstk_eip;     // kernel instruction pointer
+  unsigned long wchan;        // wait channel
+  int exit_signal;            // signal to send to parent on exit
+  int processor;              // CPU number last executed on
+  int rtprio;                 // real-time priority
+  int sched;                  // scheduling policy
+  unsigned long long blkio_tics; // time spent waiting for block IO
+  unsigned long long gtime;   // guest time (time spent in guest mode)
+  unsigned long long cgtime;  // guest time of children
+  char comm[64];              // command name (from within parentheses)
+};
+
+// procps-ng/procps/library/readproc.c stat2proc
+// Reads /proc/*/stat files, being careful not to trip over processes with
+// names like ":-) 1 2 3 4 5 6".
+// Returns true on success, false on failure.
+static bool stat2proc(const char* stat_line, proc_t& P) {
+  // Initialize default values for optional/newer kernel fields
+  P.processor = 0;
+  P.rtprio = -1;
+  P.sched = -1;
+  P.nlwp = 0;
+  P.comm[0] = '\0';
+
+  // Find the opening '(' of the command name
+  const char* S = strchr(stat_line, '(');
+  if (!S) {
     return false;
   }
-  uptime_file >> uptime_seconds;
-  return uptime_file.good();
-}
-#endif
+  S++; // skip '('
 
-CpuInfoHandler::CpuInfoHandler(Server::Instance& server) : HandlerContextBase(server) {}
-
-Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::Instance& response,
-                                             AdminStream&) {
-#if defined(__linux__)
-  const pid_t pid = getpid();
-  const long ticks_per_second = sysconf(_SC_CLK_TCK);
-  const int num_cpus = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
-  const uint32_t concurrency = server_.options().concurrency();
-
-  double uptime_seconds = 0;
-  if (!readSystemUptime(uptime_seconds) || ticks_per_second <= 0 || num_cpus <= 0 ||
-      concurrency == 0) {
-    response.add("Worker CPU utilization is not available on this platform.\n");
-    return Http::Code::OK;
+  // Find the closing ')' of the command name (search from the end to handle names with ')')
+  const char* tmp = strrchr(S, ')');
+  if (!tmp || !tmp[1]) {
+    return false;
   }
 
-  // Pre-size containers for per-worker CPU.
-  std::vector<double> cpu_per_worker(concurrency, 0.0);
-  std::vector<bool> worker_has_sample(concurrency, false);
+  // Extract command name
+  size_t comm_len = tmp - S;
+  if (comm_len >= sizeof(P.comm)) {
+    comm_len = sizeof(P.comm) - 1;
+  }
+  memcpy(P.comm, S, comm_len);
+  P.comm[comm_len] = '\0';
+
+  // Parse the rest of the fields after ") "
+  S = tmp + 2;
+
+  int ret = sscanf(S,
+                   "%c "                      // state
+                   "%d %d %d %d %d "          // ppid, pgrp, sid, tty_nr, tty_pgrp
+                   "%lu %lu %lu %lu %lu "     // flags, min_flt, cmin_flt, maj_flt, cmaj_flt
+                   "%llu %llu %llu %llu "     // utime, stime, cutime, cstime
+                   "%d %d "                   // priority, nice
+                   "%d "                      // num_threads
+                   "%lu "                     // 'alarm' == it_real_value (obsolete, always 0)
+                   "%llu "                    // start_time
+                   "%lu "                     // vsize
+                   "%lu "                     // rss
+                   "%lu %lu %lu %lu %lu %lu " // rsslim, start_code, end_code, start_stack, esp, eip
+                   "%*s %*s %*s %*s "         // pending, blocked, sigign, sigcatch <=== DISCARDED
+                   "%lu %*u %*u "             // 0 (former wchan), 0, 0 <=== Placeholders only
+                   "%d %d "                   // exit_signal, task_cpu
+                   "%d %d "                   // rt_priority, policy (sched)
+                   "%llu %llu %llu",          // blkio_ticks, gtime, cgtime
+                   &P.state,
+                   &P.ppid, &P.pgrp, &P.session, &P.tty, &P.tpgid,
+                   &P.flags, &P.min_flt, &P.cmin_flt, &P.maj_flt, &P.cmaj_flt,
+                   &P.utime, &P.stime, &P.cutime, &P.cstime,
+                   &P.priority, &P.nice,
+                   &P.nlwp,
+                   &P.alarm,
+                   &P.start_time,
+                   &P.vsize,
+                   &P.rss,
+                   &P.rss_rlim, &P.start_code, &P.end_code, &P.start_stack, &P.kstk_esp,
+                   &P.kstk_eip,
+                   /*     P.signal, P.blocked, P.sigignore, P.sigcatch,   */ /* can't use */
+                   &P.wchan, /* &P.nswap, &P.cnswap, */ /* nswap and cnswap dead for 2.4.xx and up */
+                   /* -- Linux 2.0.35 ends here -- */
+                   &P.exit_signal, &P.processor, /* 2.2.1 ends with "exit_signal" */
+                   /* -- Linux 2.2.8 to 2.5.17 end here -- */
+                   &P.rtprio, &P.sched, /* both added to 2.5.18 */
+                   &P.blkio_tics, &P.gtime, &P.cgtime);
+
+  if (!P.nlwp) {
+    P.nlwp = 1;
+  }
+
+  // Expect at least the core fields to be parsed (up to and including start_time)
+  return ret >= 20;
+}
+
+// Read total CPU jiffies from /proc/stat (sum of all CPU time fields).
+// This matches what top.c does to calculate system-wide CPU usage.
+static bool readTotalCpuJiffies(unsigned long long& total_jiffies) {
+  std::ifstream stat_file("/proc/stat");
+  if (!stat_file.is_open()) {
+    return false;
+  }
+
+  std::string line;
+  std::getline(stat_file, line);
+  if (!absl::StartsWith(line, "cpu ")) {
+    return false;
+  }
+
+  // The first line is "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
+  // We sum all fields to get total jiffies.
+  std::istringstream iss(line.substr(5)); // skip "cpu  "
+  unsigned long long sum = 0;
+  unsigned long long value;
+  while (iss >> value) {
+    sum += value;
+  }
+
+  total_jiffies = sum;
+  return true;
+}
+
+
+// Sample data for a worker thread
+struct WorkerSample {
+  pid_t tid;
+  uint32_t worker_index;
+  unsigned long long utime;
+  unsigned long long stime;
+  bool valid;
+};
+
+// Read all worker thread stats for a single sample.
+// Returns a map of worker_index -> WorkerSample.
+static absl::flat_hash_map<uint32_t, WorkerSample>
+readWorkerThreadStats(pid_t pid, uint32_t concurrency) {
+  absl::flat_hash_map<uint32_t, WorkerSample> samples;
 
   const std::string task_dir = fmt::format("/proc/{}/task", pid);
-  response.add(fmt::format("Task directory: {}\n", task_dir));
-  response.add(fmt::format("PID: {}\n", pid));
-  response.add(fmt::format("Ticks per second: {}\n", ticks_per_second));
-  response.add(fmt::format("Number of CPUs: {}\n", num_cpus));
-  response.add(fmt::format("Concurrency: {}\n", concurrency));
-  response.add(fmt::format("Uptime seconds: {}\n", uptime_seconds));
-
   DIR* dir = opendir(task_dir.c_str());
   if (dir == nullptr) {
-    response.add("Worker CPU utilization is not available on this platform.\n");
-    return Http::Code::OK;
+    return samples;
   }
 
-  // Traverse all threads in this process: each entry name in /proc/<pid>/task is a TID.
+  static constexpr absl::string_view kWorkerPrefix = "wrk:worker_";
+
   while (dirent* entry = readdir(dir)) {
     // Skip "." and "..".
     if (entry->d_name[0] == '.' &&
         (entry->d_name[1] == '\0' || (entry->d_name[1] == '.' && entry->d_name[2] == '\0'))) {
       continue;
     }
+
     char* endptr = nullptr;
     const long tid_long = std::strtol(entry->d_name, &endptr, 10);
     if (endptr == nullptr || *endptr != '\0' || tid_long <= 0) {
-      continue; // Not a numeric thread id.
+      continue;
     }
     const pid_t tid = static_cast<pid_t>(tid_long);
 
@@ -83,96 +218,120 @@ Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::I
       continue;
     }
 
-    response.add(fmt::format("Stat path: {}\n", stat_path));
-
     std::string stat_line;
     std::getline(stat_file, stat_line);
     if (stat_line.empty()) {
       continue;
     }
 
-    response.add(fmt::format("Stat line: {}\n", stat_line));
-
-    // Extract the thread name from the (comm) field and the remainder of the stat line.
-    const auto lparen = stat_line.find('(');
-    const auto rparen = stat_line.rfind(')');
-    if (lparen == std::string::npos || rparen == std::string::npos || rparen <= lparen) {
+    proc_t P;
+    if (!stat2proc(stat_line.c_str(), P)) {
       continue;
     }
 
-    const std::string comm = stat_line.substr(lparen + 1, rparen - lparen - 1);
-    response.add(fmt::format("Comm: {}\n", comm));
-    // Worker threads are named "wrk:<dispatcher_name>", where dispatcher_name is "worker_<i>".
-    // That yields names like "wrk:worker_0", one per Envoy worker.
-    static constexpr absl::string_view kWorkerPrefix = "wrk:worker_";
-    if (!absl::StartsWith(comm, kWorkerPrefix)) {
+    // Only process worker threads
+    if (!absl::StartsWith(P.comm, kWorkerPrefix)) {
       continue;
     }
 
-    // Parse the worker index from the suffix of the name.
-    const absl::string_view index_str = absl::string_view(comm).substr(kWorkerPrefix.size());
+    // Parse the worker index from the thread name
+    const absl::string_view index_str = absl::string_view(P.comm).substr(kWorkerPrefix.size());
     uint32_t worker_index = 0;
     if (!absl::SimpleAtoi(index_str, &worker_index) || worker_index >= concurrency) {
-      response.add(fmt::format("Worker index: {}\n", worker_index));
       continue;
     }
 
-    response.add(fmt::format("Worker index X: {}\n", worker_index));
-    // Parse the timing fields from the remainder of the stat line (fields 3+).
-    const std::string rest = stat_line.substr(rparen + 2);
-    std::istringstream iss(rest);
-
-    double utime_ticks = 0;
-    double stime_ticks = 0;
-    long long starttime_ticks = 0;
-
-    std::string token;
-    int index = 1;
-    while (iss >> token) {
-      if (index == 11) {
-        utime_ticks = std::strtod(token.c_str(), nullptr);
-      } else if (index == 12) {
-        stime_ticks = std::strtod(token.c_str(), nullptr);
-      } else if (index == 19) {
-        starttime_ticks = std::strtoll(token.c_str(), nullptr, 10);
-        break;
-      }
-      ++index;
-    }
-
-    if (starttime_ticks <= 0) {
-      continue;
-    }
-
-    const double total_time_seconds =
-        (utime_ticks + stime_ticks) / static_cast<double>(ticks_per_second);
-    const double starttime_seconds =
-        static_cast<double>(starttime_ticks) / static_cast<double>(ticks_per_second);
-    const double seconds = uptime_seconds - starttime_seconds;
-
-    if (seconds <= 0.0) {
-      response.add(fmt::format("Seconds: {}\n", seconds));
-      continue;
-    }
-
-    response.add(fmt::format("Total time seconds: {}\n", total_time_seconds));
-    response.add(fmt::format("Seconds: {}\n", seconds));
-    response.add(fmt::format("Number of CPUs: {}\n", num_cpus));
-    const double cpu_percent =
-        (total_time_seconds / seconds) * (100.0 / static_cast<double>(num_cpus));
-    response.add(fmt::format("CPU percent: {}\n", cpu_percent));
-    response.add(fmt::format("Worker index: {}\n", worker_index));
-    cpu_per_worker[worker_index] = cpu_percent;
-    worker_has_sample[worker_index] = true;
+    WorkerSample sample;
+    sample.tid = tid;
+    sample.worker_index = worker_index;
+    sample.utime = P.utime;
+    sample.stime = P.stime;
+    sample.valid = true;
+    samples[worker_index] = sample;
   }
-  response.add("======================\n");
+
   closedir(dir);
+  return samples;
+}
+
+#endif
+
+CpuInfoHandler::CpuInfoHandler(Server::Instance& server) : HandlerContextBase(server) {}
+
+Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::Instance& response,
+                                             AdminStream&) {
+#if defined(__linux__)
+  const pid_t pid = getpid();
+  const uint32_t concurrency = server_.options().concurrency();
+
+  if (concurrency == 0) {
+    response.add("Worker CPU utilization is not available (concurrency is 0).\n");
+    return Http::Code::OK;
+  }
+
+  // Take first sample: total CPU jiffies and per-thread stats
+  unsigned long long prev_total_jiffies = 0;
+  if (!readTotalCpuJiffies(prev_total_jiffies)) {
+    response.add("Failed to read total CPU jiffies.\n");
+    return Http::Code::OK;
+  }
+
+  absl::flat_hash_map<uint32_t, WorkerSample> prev_samples =
+      readWorkerThreadStats(pid, concurrency);
+
+  // Sleep for the sampling interval
+  // do an extra procs refresh to avoid %cpu distortions...
+  usleep(LIB_USLEEP);
+
+  // Take second sample: total CPU jiffies and per-thread stats
+  unsigned long long cur_total_jiffies = 0;
+  if (!readTotalCpuJiffies(cur_total_jiffies)) {
+    response.add("Failed to read total CPU jiffies on second sample.\n");
+    return Http::Code::OK;
+  }
+
+  absl::flat_hash_map<uint32_t, WorkerSample> cur_samples =
+      readWorkerThreadStats(pid, concurrency);
+
+  // Calculate delta_total (total system CPU time across all CPUs)
+  const unsigned long long delta_total = cur_total_jiffies - prev_total_jiffies;
+
+  if (delta_total == 0) {
+    response.add("No CPU time elapsed between samples.\n");
+    return Http::Code::OK;
+  }
+
+  // Calculate per-worker CPU percentage
+  std::vector<double> cpu_per_worker(concurrency, 0.0);
+  std::vector<bool> worker_has_sample(concurrency, false);
+
+  for (uint32_t i = 0; i < concurrency; ++i) {
+    auto prev_it = prev_samples.find(i);
+    auto cur_it = cur_samples.find(i);
+
+    if (prev_it != prev_samples.end() && cur_it != cur_samples.end()) {
+      const WorkerSample& prev = prev_it->second;
+      const WorkerSample& cur = cur_it->second;
+
+      // Calculate delta_task = (cur->utime + cur->stime) - (prev->utime + prev->stime)
+      const unsigned long long prev_task = prev.utime + prev.stime;
+      const unsigned long long cur_task = cur.utime + cur.stime;
+      const unsigned long long delta_task = cur_task - prev_task;
+
+      // thread_pcpu = (delta_task / delta_total) * 100.0
+      // This gives the percentage of total system CPU time (across all CPUs) used by this thread.
+      const double thread_pcpu =
+          (static_cast<double>(delta_task) / static_cast<double>(delta_total)) * 100.0;
+
+      cpu_per_worker[i] = thread_pcpu;
+      worker_has_sample[i] = true;
+    }
+  }
 
   response.add("Each worker thread CPU utilization (similar to Linux top):\n");
   for (uint32_t i = 0; i < concurrency; ++i) {
     if (worker_has_sample[i]) {
-      response.add(
-          fmt::format("Worker {}: {:.2f}%\n", i, cpu_per_worker[i]));
+      response.add(fmt::format("Worker {}: {:.2f}%\n", i, cpu_per_worker[i]));
     } else {
       response.add(fmt::format("Worker {}: n/a\n", i));
     }

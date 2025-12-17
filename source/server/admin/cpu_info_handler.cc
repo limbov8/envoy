@@ -1,8 +1,10 @@
 #include "source/server/admin/cpu_info_handler.h"
 
+#include <cmath>
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 
 #if defined(__linux__)
 #include <dirent.h>
@@ -28,26 +30,45 @@ namespace Server {
 static constexpr absl::string_view kWorkerThreadPrefix = "wrk:worker_";
 static constexpr absl::string_view kMainThreadName = "envoy";
 
-// Adapted from procps-ng's procps_hertz_get().
+// Adapted from procps-ng's cpuCount().
 // See: https://gitlab.com/procps-ng/procps/-/blob/master/library/stat.c
-static long procps_hertz_get() {
-#ifdef _SC_CLK_TCK
-  long hz = sysconf(_SC_CLK_TCK);
-  if (hz > 0) {
-    return hz;
+long CpuInfoHandler::cpuCount() {
+  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus < 1) {
+    return 1;
   }
-#endif
-#ifdef HZ
-  return HZ;
-#endif
-  // Last resort, assume 100
-  return 100;
+  return cpus;
+}
+
+bool CpuInfoHandler::readTotalCpuJiffies(unsigned long long& total_jiffies) {
+  std::ifstream stat_file("/proc/stat");
+  if (!stat_file.is_open()) {
+    return false;
+  }
+
+  std::string line;
+  std::getline(stat_file, line);
+  if (!absl::StartsWith(line, "cpu ")) {
+    return false;
+  }
+
+  // Parse: "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
+  // Sum all fields to get total jiffies across all CPUs.
+  std::istringstream iss(line.substr(5)); // skip "cpu  "
+  unsigned long long sum = 0;
+  unsigned long long value;
+  while (iss >> value) {
+    sum += value;
+  }
+
+  total_jiffies = sum;
+  return true;
 }
 
 // Adapted from procps-ng's stat2proc().
 // See: https://gitlab.com/procps-ng/procps/-/blob/master/library/readproc.c
 // Parses /proc/*/stat files, handling process names that contain special characters.
-static bool stat2proc(const char* stat_line, proc_t& P) {
+bool CpuInfoHandler::stat2proc(const char* stat_line, proc_t& P) {
   P = {};
 
   // Find the opening '(' of the command name
@@ -178,23 +199,33 @@ Http::Code CpuInfoHandler::measureDeltaCpuUtilization(uint64_t sampling_interval
                                                       Http::ResponseHeaderMap& response_headers,
                                                       Buffer::Instance& response) {
   const pid_t pid = getpid();
-  const long hertz = procps_hertz_get();
   const uint32_t concurrency = server_.options().concurrency();
+  const long num_cpus = cpuCount();
   const uint64_t sampling_interval_us = sampling_interval_ms * 1000;
 
-  // Take first sample of per-thread stats
+  // Take first sample: total CPU jiffies and per-thread stats
+  unsigned long long prev_total_jiffies = 0;
+  if (!readTotalCpuJiffies(prev_total_jiffies)) {
+    return returnError("Failed to read /proc/stat.", format, response_headers, response);
+  }
   EnvoyThreadCpuStatSamples prev_samples = readEnvoyThreadSamples(pid, concurrency);
 
   // Sleep for the sampling interval
   usleep(sampling_interval_us);
 
-  // Take second sample of per-thread stats
+  // Take second sample: total CPU jiffies and per-thread stats
+  unsigned long long cur_total_jiffies = 0;
+  if (!readTotalCpuJiffies(cur_total_jiffies)) {
+    return returnError("Failed to read /proc/stat.", format, response_headers, response);
+  }
   EnvoyThreadCpuStatSamples cur_samples = readEnvoyThreadSamples(pid, concurrency);
 
   // Calculate total jiffies per CPU over the sampling interval.
-  // Formula: jiffies = interval_seconds * hertz
-  const double sampling_interval_sec = static_cast<double>(sampling_interval_us) / 1000000.0;
-  const double total_jiffies_per_cpu = sampling_interval_sec * static_cast<double>(hertz);
+  const unsigned long long delta_total = cur_total_jiffies - prev_total_jiffies;
+  if (delta_total == 0) {
+    return returnError("No CPU time elapsed.", format, response_headers, response);
+  }
+  const double total_jiffies_per_cpu = static_cast<double>(delta_total) / static_cast<double>(num_cpus);
 
   // Calculate per-worker CPU percentage
   std::vector<double> cpu_per_worker(concurrency, 0.0);
@@ -216,9 +247,9 @@ Http::Code CpuInfoHandler::measureDeltaCpuUtilization(uint64_t sampling_interval
       const unsigned long long delta_task = cur_task - prev_task;
 
       // Irix-style per-thread %CPU, like top's default, using per-CPU total jiffies
-      // over the interval as the time base.
+      // over the interval as the time base. Round to 2 decimal places.
       const double thread_pcpu =
-          (static_cast<double>(delta_task) / total_jiffies_per_cpu) * 100.0;
+          std::round((static_cast<double>(delta_task) / total_jiffies_per_cpu) * 10000.0) / 100.0;
 
       cpu_per_worker[i] = thread_pcpu;
       worker_has_sample[i] = true;
@@ -232,7 +263,8 @@ Http::Code CpuInfoHandler::measureDeltaCpuUtilization(uint64_t sampling_interval
     const unsigned long long prev_task = prev.utime + prev.stime;
     const unsigned long long cur_task = cur.utime + cur.stime;
     const unsigned long long delta_task = cur_task - prev_task;
-    main_thread_cpu = (static_cast<double>(delta_task) / total_jiffies_per_cpu) * 100.0;
+    main_thread_cpu =
+        std::round((static_cast<double>(delta_task) / total_jiffies_per_cpu) * 10000.0) / 100.0;
     has_main_thread_sample = true;
   }
 

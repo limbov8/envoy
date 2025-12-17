@@ -56,9 +56,9 @@ private:
   Http::Code returnError(absl::string_view msg, CpuInfoFormat format,
                          Http::ResponseHeaderMap& response_headers, Buffer::Instance& response);
 #if defined(__linux__)
-  long cpuCount();
+  long getHertz();
+  double getBootTimeSeconds();
   bool stat2proc(const char* stat_line, proc_t& P);
-  bool readTotalCpuJiffies(unsigned long long& total_jiffies);
   EnvoyThreadCpuStatSamples readEnvoyThreadSamples(pid_t pid, uint32_t concurrency);
   Http::Code measureDeltaCpuUtilization(uint64_t sampling_interval_ms, CpuInfoFormat format,
                                         Http::ResponseHeaderMap& response_headers,

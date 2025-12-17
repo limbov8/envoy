@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
-#include <sstream>
 
 #if defined(__linux__)
 #include <dirent.h>
@@ -30,39 +29,29 @@ namespace Server {
 static constexpr absl::string_view kWorkerThreadPrefix = "wrk:worker_";
 static constexpr absl::string_view kMainThreadName = "envoy";
 
-// Adapted from procps-ng's cpuCount().
+// Adapted from procps-ng's procps_hertz_get().
 // See: https://gitlab.com/procps-ng/procps/-/blob/master/library/stat.c
-long CpuInfoHandler::cpuCount() {
-  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
-  if (cpus < 1) {
-    return 1;
+long CpuInfoHandler::getHertz() {
+#ifdef _SC_CLK_TCK
+  long hz = sysconf(_SC_CLK_TCK);
+  if (hz > 0) {
+    return hz;
   }
-  return cpus;
+#endif
+#ifdef HZ
+  return HZ;
+#endif
+  // Last resort, assume 100
+  return 100;
 }
 
-bool CpuInfoHandler::readTotalCpuJiffies(unsigned long long& total_jiffies) {
-  std::ifstream stat_file("/proc/stat");
-  if (!stat_file.is_open()) {
-    return false;
+// Get current boot time in seconds using CLOCK_BOOTTIME.
+double CpuInfoHandler::getBootTimeSeconds() {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) {
+    return -1.0;
   }
-
-  std::string line;
-  std::getline(stat_file, line);
-  if (!absl::StartsWith(line, "cpu ")) {
-    return false;
-  }
-
-  // Parse: "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
-  // Sum all fields to get total jiffies across all CPUs.
-  std::istringstream iss(line.substr(5)); // skip "cpu  "
-  unsigned long long sum = 0;
-  unsigned long long value;
-  while (iss >> value) {
-    sum += value;
-  }
-
-  total_jiffies = sum;
-  return true;
+  return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1.0e-9;
 }
 
 // Adapted from procps-ng's stat2proc().
@@ -200,32 +189,33 @@ Http::Code CpuInfoHandler::measureDeltaCpuUtilization(uint64_t sampling_interval
                                                       Buffer::Instance& response) {
   const pid_t pid = getpid();
   const uint32_t concurrency = server_.options().concurrency();
-  const long num_cpus = cpuCount();
+  const long hertz = getHertz();
   const uint64_t sampling_interval_us = sampling_interval_ms * 1000;
 
-  // Take first sample: total CPU jiffies and per-thread stats
-  unsigned long long prev_total_jiffies = 0;
-  if (!readTotalCpuJiffies(prev_total_jiffies)) {
-    return returnError("Failed to read /proc/stat.", format, response_headers, response);
+  // Take first sample: boot time and per-thread stats
+  const double prev_time = getBootTimeSeconds();
+  if (prev_time < 0) {
+    return returnError("Failed to read CLOCK_BOOTTIME.", format, response_headers, response);
   }
   EnvoyThreadCpuStatSamples prev_samples = readEnvoyThreadSamples(pid, concurrency);
 
   // Sleep for the sampling interval
   usleep(sampling_interval_us);
 
-  // Take second sample: total CPU jiffies and per-thread stats
-  unsigned long long cur_total_jiffies = 0;
-  if (!readTotalCpuJiffies(cur_total_jiffies)) {
-    return returnError("Failed to read /proc/stat.", format, response_headers, response);
-  }
+  // Take second sample: boot time and per-thread stats
   EnvoyThreadCpuStatSamples cur_samples = readEnvoyThreadSamples(pid, concurrency);
+  const double cur_time = getBootTimeSeconds();
+  if (cur_time < 0) {
+    return returnError("Failed to read CLOCK_BOOTTIME.", format, response_headers, response);
+  }
 
   // Calculate total jiffies per CPU over the sampling interval.
-  const unsigned long long delta_total = cur_total_jiffies - prev_total_jiffies;
-  if (delta_total == 0) {
-    return returnError("No CPU time elapsed.", format, response_headers, response);
+  // Formula: jiffies = delta_time_seconds * hertz
+  const double delta_time = cur_time - prev_time;
+  if (delta_time <= 0) {
+    return returnError("No time elapsed.", format, response_headers, response);
   }
-  const double total_jiffies_per_cpu = static_cast<double>(delta_total) / static_cast<double>(num_cpus);
+  const double total_jiffies_per_cpu = delta_time * static_cast<double>(hertz);
 
   // Calculate per-worker CPU percentage
   std::vector<double> cpu_per_worker(concurrency, 0.0);

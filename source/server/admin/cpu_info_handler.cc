@@ -21,7 +21,7 @@ namespace Server {
 #if defined(__linux__)
 
 // Sampling delay in microseconds, matching top.c's LIB_USLEEP
-constexpr int LIB_USLEEP = 200000; // 200ms
+constexpr int LIB_USLEEP = 1000000; // 1s
 
 // Equivalent to procps-ng's procps_cpu_count(): obtain number of online CPUs
 // with a safe minimum of 1.

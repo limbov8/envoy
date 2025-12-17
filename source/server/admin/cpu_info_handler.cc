@@ -23,6 +23,16 @@ namespace Server {
 // Sampling delay in microseconds, matching top.c's LIB_USLEEP
 constexpr int LIB_USLEEP = 200000; // 200ms
 
+// Equivalent to procps-ng's procps_cpu_count(): obtain number of online CPUs
+// with a safe minimum of 1.
+static long procps_cpu_count() {
+  long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus < 1) {
+    return 1;
+  }
+  return cpus;
+}
+
 // Process information structure matching procps implementation.
 // Keeps all fields even if not currently used for future extensibility.
 struct proc_t {
@@ -38,15 +48,15 @@ struct proc_t {
   unsigned long cmin_flt;     // minor page faults of children
   unsigned long maj_flt;      // major page faults
   unsigned long cmaj_flt;     // major page faults of children
-  unsigned long long utime;   // user mode jiffies
-  unsigned long long stime;   // kernel mode jiffies
-  unsigned long long cutime;  // user mode jiffies with children
-  unsigned long long cstime;  // kernel mode jiffies with children
+  unsigned long long utime;   // user-mode CPU time accumulated by process
+  unsigned long long stime;   // kernel-mode CPU time accumulated by process
+  unsigned long long cutime;  // cumulative utime of process and reaped children
+  unsigned long long cstime;  // cumulative stime of process and reaped children
   int priority;               // kernel scheduling priority
   int nice;                   // nice value
   int nlwp;                   // number of threads
   unsigned long alarm;        // 'alarm' == it_real_value (obsolete, always 0)
-  unsigned long long start_time; // start time in jiffies since boot
+  unsigned long long start_time; // start time of process -- seconds since system boot
   unsigned long vsize;        // virtual memory size in bytes
   unsigned long rss;          // resident set size
   unsigned long rss_rlim;     // rss limit
@@ -263,6 +273,7 @@ Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::I
 #if defined(__linux__)
   const pid_t pid = getpid();
   const uint32_t concurrency = server_.options().concurrency();
+  const int num_cpus = static_cast<int>(procps_cpu_count());
 
   if (concurrency == 0) {
     response.add("Worker CPU utilization is not available (concurrency is 0).\n");
@@ -296,10 +307,18 @@ Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::I
   // Calculate delta_total (total system CPU time across all CPUs)
   const unsigned long long delta_total = cur_total_jiffies - prev_total_jiffies;
 
+  response.add(fmt::format("delta_total: {}\n", delta_total));
+  response.add(fmt::format("prev_total_jiffies: {}\n", prev_total_jiffies));
+  response.add(fmt::format("cur_total_jiffies: {}\n", cur_total_jiffies));
+
   if (delta_total == 0) {
     response.add("No CPU time elapsed between samples.\n");
     return Http::Code::OK;
   }
+
+  // Per-CPU share of total jiffies over the sampling interval.
+  const double total_jiffies_per_cpu =
+      static_cast<double>(delta_total) / static_cast<double>(num_cpus);
 
   // Calculate per-worker CPU percentage
   std::vector<double> cpu_per_worker(concurrency, 0.0);
@@ -313,15 +332,26 @@ Http::Code CpuInfoHandler::handlerWorkersCpu(Http::ResponseHeaderMap&, Buffer::I
       const WorkerSample& prev = prev_it->second;
       const WorkerSample& cur = cur_it->second;
 
+      response.add(fmt::format("prev.tid: {}\n", prev.tid));
+      response.add(fmt::format("prev.worker_index: {}\n", prev.worker_index));
+      response.add(fmt::format("prev.utime: {}\n", prev.utime));
+      response.add(fmt::format("prev.stime: {}\n", prev.stime));
+      response.add(fmt::format("cur.tid: {}\n", cur.tid));
+      response.add(fmt::format("cur.worker_index: {}\n", cur.worker_index));
+      response.add(fmt::format("cur.utime: {}\n", cur.utime));
+      response.add(fmt::format("cur.stime: {}\n", cur.stime));
+
       // Calculate delta_task = (cur->utime + cur->stime) - (prev->utime + prev->stime)
       const unsigned long long prev_task = prev.utime + prev.stime;
       const unsigned long long cur_task = cur.utime + cur.stime;
       const unsigned long long delta_task = cur_task - prev_task;
 
-      // thread_pcpu = (delta_task / delta_total) * 100.0
-      // This gives the percentage of total system CPU time (across all CPUs) used by this thread.
+      response.add(fmt::format("delta_task: {}\n", delta_task));
+
+      // Irix-style per-thread %CPU, like top's default, using per-CPU total jiffies
+      // over the interval as the time base.
       const double thread_pcpu =
-          (static_cast<double>(delta_task) / static_cast<double>(delta_total)) * 100.0;
+          (static_cast<double>(delta_task) / total_jiffies_per_cpu) * 100.0;
 
       cpu_per_worker[i] = thread_pcpu;
       worker_has_sample[i] = true;

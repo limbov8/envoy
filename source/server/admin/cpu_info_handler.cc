@@ -274,13 +274,13 @@ Http::Code CpuInfoHandler::measureDeltaCpuUtilization(uint64_t sampling_interval
     for (uint32_t i = 0; i < concurrency; ++i) {
       const std::string name = fmt::format("{}{}", kWorkerThreadPrefix, i);
       if (worker_has_sample[i]) {
-        response.add(fmt::format("{}: {:.2f}%\n", name, cpu_per_worker[i]));
+        response.add(fmt::format("{}: {:.2f}\n", name, cpu_per_worker[i]));
       } else {
         response.add(fmt::format("{}: n/a\n", name));
       }
     }
     if (has_main_thread_sample) {
-      response.add(fmt::format("{}: {:.2f}%\n", kMainThreadName, main_thread_cpu));
+      response.add(fmt::format("{}: {:.2f}\n", kMainThreadName, main_thread_cpu));
     } else {
       response.add(fmt::format("{}: n/a\n", kMainThreadName));
     }

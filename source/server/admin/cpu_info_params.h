@@ -22,13 +22,13 @@ struct CpuInfoParams {
    *
    * Supported params:
    * - sampling_interval_ms: integer (default 1000)
-   * - format: json|text (default json)
+   * - format: json|text (default text)
    */
   Http::Code parse(absl::string_view url, Buffer::Instance& response);
 
   static absl::string_view formatToString(CpuInfoFormat format);
 
-  CpuInfoFormat format_{CpuInfoFormat::Json};
+  CpuInfoFormat format_{CpuInfoFormat::Text};
   uint64_t sampling_interval_ms_{1000};
 
   Http::Utility::QueryParamsMulti query_;
